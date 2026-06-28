@@ -27,6 +27,19 @@ Telegram-бот для управления заявками на обмен RUB
 | `p2p-bot.service` | systemd-юнит для запуска на сервере |
 | `DEPLOY.md` | Пошаговая инструкция деплоя на VPS (Ubuntu/Debian) |
 | `Claude.md` | Документация проекта (этот файл) |
+| `.gitignore` | Исключения для git (`__pycache__/`, `tmp/`, `.env`, `venv/`) |
+
+---
+
+## Git-репозиторий
+
+- **Remote:** `git@github.com:Levonlv/p2p2_new_paris.git` (приватный, доступ по SSH)
+- **Ветка:** `main`
+- **Игнорируется** (`.gitignore`): `__pycache__/`, `tmp/`, `.env`, `venv/`, `.DS_Store`
+- **Коммитится:** код, `state.json` (как бэкап состояния), `.env.example`, доки, `p2p-bot.service`
+- ⚠️ Реальный `.env` с `BOT_TOKEN` в репозиторий **не попадает** (в `.gitignore`)
+- ⚠️ `Claude.md` содержит IP прод-сервера — при переводе репо в публичный сначала вычистить
+- Пуш изменений: `git add -A && git commit -m "..." && git push`
 
 ---
 
