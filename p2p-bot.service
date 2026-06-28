@@ -1,0 +1,30 @@
+[Unit]
+Description=P2P Telegram Bot (RUB <-> USDT заявки)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=p2pbot
+Group=p2pbot
+WorkingDirectory=/opt/p2p-bot
+EnvironmentFile=/opt/p2p-bot/.env
+ExecStart=/opt/p2p-bot/venv/bin/python /opt/p2p-bot/simple_bot.py
+
+# Автоперезапуск при падении (в дополнение к внутреннему retry-циклу бота)
+Restart=always
+RestartSec=10
+
+# Логи идут в journald (journalctl -u p2p-bot)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=p2p-bot
+
+# Базовая изоляция процесса
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
