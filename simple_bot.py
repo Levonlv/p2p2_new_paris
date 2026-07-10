@@ -45,6 +45,8 @@ except ImportError as e:
     class ContextTypes:
         DEFAULT_TYPE = None
 
+import templates_store
+
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x)
@@ -221,6 +223,7 @@ def load_state() -> Dict[str, Any]:
     data.setdefault("merchant_stats", {})
     data.setdefault("deals", [])
     data.setdefault("ratings", {})
+    data.setdefault("templates", {})
 
     # Самолечение мигрировавших групп: если чат с известным именем висит под старым id,
     # переносим его на актуальный id из DEFAULT_CHATS (иначе ломается дедупликация отправки).
