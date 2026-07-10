@@ -2503,7 +2503,7 @@ async def _render_templates_list(send_func, state, uid):
             InlineKeyboardButton("🗑", callback_data=f"tpl:del:{i}"),
         ])
     await send_func(
-        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML"
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode=safe_parse_mode()
     )
 
 
