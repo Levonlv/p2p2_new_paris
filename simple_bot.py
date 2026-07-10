@@ -2475,6 +2475,38 @@ async def cmd_history(update: Update, context) -> None:
 
 # ─── /stats command ────────────────────────────────────────────────────────
 
+async def templates_cmd(update: Update, context) -> None:
+    """/templates — просмотр/переименование/удаление шаблонов."""
+    if not check_private_chat_only(update):
+        return
+    state = load_state()
+    uid = update.effective_user.id
+    if not await check_not_banned(update, state):
+        return
+    if not can_create_orders(uid, state):
+        await update.message.reply_text("❌ Команда для мерчантов и админов.")
+        return
+    await _render_templates_list(update.message.reply_text, state, uid)
+
+
+async def _render_templates_list(send_func, state, uid):
+    templates = templates_store.list_templates(state, uid)
+    if not templates:
+        await send_func("У тебя пока нет шаблонов.\nСоздай заявку и нажми «💾 В шаблон».")
+        return
+    lines = ["📋 <b>Твои шаблоны:</b>\n"]
+    buttons = []
+    for i, t in enumerate(templates):
+        lines.append(f"{i + 1}. {escape_html(t['name'])} — {escape_html(str(t.get('direction', '')))}")
+        buttons.append([
+            InlineKeyboardButton(f"✏️ {t['name'][:15]}", callback_data=f"tpl:rename:{i}"),
+            InlineKeyboardButton("🗑", callback_data=f"tpl:del:{i}"),
+        ])
+    await send_func(
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML"
+    )
+
+
 async def cmd_stats(update: Update, context) -> None:
     """/stats — расширенная статистика для админов с топом партнёров."""
     if not check_private_chat_only(update):
@@ -3259,6 +3291,26 @@ async def handle_message(update: Update, context):
         )
         return
 
+    elif session["step"] == "template_rename":
+        state = load_state()
+        index = session["data"].get("rename_index")
+        ok, code = templates_store.rename_template(state, uid, index, text)
+        if not ok:
+            msgs = {
+                "empty": "❌ Имя не может быть пустым.",
+                "too_long": "❌ Имя слишком длинное (макс. 30 символов).",
+                "exists": "❌ Шаблон с таким именем уже есть.",
+                "not_found": "❌ Шаблон не найден.",
+            }
+            await update.message.reply_text(msgs.get(code, "❌ Ошибка.") + " Попробуй ещё раз или /templates.")
+            if code == "not_found":
+                del user_sessions[uid]
+            return
+        save_state(state)
+        del user_sessions[uid]
+        await update.message.reply_text("✅ Шаблон переименован.")
+        return
+
     # Обработка команды /back для возврата к предыдущему шагу
     if text == "/back" and uid in user_sessions:
         session = user_sessions[uid]
@@ -4014,6 +4066,7 @@ async def set_user_commands(bot, user_id: int, role: str):
     merchant_commands = [
         BotCommand("create", "Создать заявку"),
         BotCommand("myorders", "Мои активные заявки"),
+        BotCommand("templates", "Мои шаблоны заявок"),
         BotCommand("partner", "Карточка партнёра"),
         BotCommand("history", "История сделок"),
         BotCommand("timezone", "Часовой пояс"),
@@ -4023,6 +4076,7 @@ async def set_user_commands(bot, user_id: int, role: str):
     admin_commands = [
         BotCommand("create", "Создать заявку"),
         BotCommand("myorders", "Мои активные заявки"),
+        BotCommand("templates", "Мои шаблоны заявок"),
         BotCommand("partner", "Карточка партнёра"),
         BotCommand("history", "История сделок"),
         BotCommand("timezone", "Часовой пояс"),
@@ -4154,6 +4208,7 @@ async def main():
         _app.add_handler(CommandHandler("addmerchant", cmd_addmerchant))
         _app.add_handler(CommandHandler("removemerchant", cmd_removemerchant))
         _app.add_handler(CommandHandler("merchants", cmd_listmerchants))
+        _app.add_handler(CommandHandler("templates", templates_cmd))
         _app.add_handler(CallbackQueryHandler(on_callback))
         _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         _app.add_handler(MessageHandler(filters.COMMAND, unknown))
@@ -4442,7 +4497,56 @@ async def handle_close_claimed_expired_order(update: Update, context, state: Dic
 
 
 async def handle_template_manage_callback(update, context, state, data, action, parts):
-    await update.callback_query.edit_message_text("⚙️ В разработке.")
+    q = update.callback_query
+    uid = q.from_user.id
+
+    def _index():
+        try:
+            return int(parts[2])
+        except (IndexError, ValueError):
+            return None
+
+    if action == "rename":
+        index = _index()
+        tpl = templates_store.get_template(state, uid, index) if index is not None else None
+        if not tpl:
+            await q.edit_message_text("❌ Шаблон не найден. Открой /templates заново.")
+            return
+        user_sessions[uid] = {"step": "template_rename", "data": {"rename_index": index}}
+        await q.edit_message_text(
+            f"✏️ Введи новое имя для «{escape_html(tpl['name'])}» (до 30 символов):",
+            parse_mode=safe_parse_mode()
+        )
+        return
+
+    if action == "del":
+        index = _index()
+        tpl = templates_store.get_template(state, uid, index) if index is not None else None
+        if not tpl:
+            await q.edit_message_text("❌ Шаблон не найден. Открой /templates заново.")
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"tpl:delok:{index}")],
+            [InlineKeyboardButton("✖️ Отмена", callback_data="tpl:delno")],
+        ])
+        await q.edit_message_text(
+            f"Удалить шаблон «{escape_html(tpl['name'])}»?",
+            reply_markup=keyboard, parse_mode=safe_parse_mode()
+        )
+        return
+
+    if action == "delok":
+        index = _index()
+        if index is None or not templates_store.delete_template(state, uid, index):
+            await q.edit_message_text("❌ Шаблон не найден.")
+            return
+        save_state(state)
+        await q.edit_message_text("🗑 Шаблон удалён.")
+        return
+
+    if action == "delno":
+        await q.edit_message_text("✖️ Удаление отменено.")
+        return
 
 
 if __name__ == "__main__":
