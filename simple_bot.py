@@ -2539,10 +2539,10 @@ async def _render_templates_list(send_func, state, uid):
     buttons = []
     for i, t in enumerate(templates):
         lines.append(f"{i + 1}. {escape_html(t['name'])} — {escape_html(str(t.get('direction', '')))}")
-        buttons.append([
-            InlineKeyboardButton(f"✏️ {t['name'][:15]}", callback_data=f"tpl:rename:{i}"),
-            InlineKeyboardButton("🗑", callback_data=f"tpl:del:{i}"),
-        ])
+        # Имя — широкой кнопкой во всю ширину ряда (видно целиком, нажатие = переименовать),
+        # удаление — отдельным рядом с номером из списка выше.
+        buttons.append([InlineKeyboardButton(f"✏️ {t['name']}", callback_data=f"tpl:rename:{i}")])
+        buttons.append([InlineKeyboardButton(f"🗑 Удалить №{i + 1}", callback_data=f"tpl:del:{i}")])
     await send_func(
         "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode=safe_parse_mode()
     )
