@@ -1284,7 +1284,28 @@ async def create_order_start(update: Update, context):
         await update.message.reply_text("Только админы и мерчанты могут создавать заявки.")
         return
     
-    # Initialize user session
+    templates = templates_store.list_templates(state, uid)
+    if templates:
+        user_sessions[uid] = {
+            "step": "choose_template",
+            "data": {
+                "creator_id": uid,
+                "creator_username": getattr(update.effective_user, 'username', None) or str(uid),
+            }
+        }
+        buttons = [
+            [InlineKeyboardButton(f"📋 {t['name']}", callback_data=f"tpl:use:{i}")]
+            for i, t in enumerate(templates)
+        ]
+        buttons.append([InlineKeyboardButton("➕ Новую с нуля", callback_data="tpl:new")])
+        buttons.append([InlineKeyboardButton("✖️ Отмена", callback_data="tpl:cancel")])
+        await update.message.reply_text(
+            "🏗 Создать заявку\n\nВыбери шаблон или создай новую:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # Нет шаблонов — обычный флоу с выбора направления
     user_sessions[uid] = {
         "step": "direction",
         "data": {
@@ -1292,12 +1313,10 @@ async def create_order_start(update: Update, context):
             "creator_username": getattr(update.effective_user, 'username', None) or str(uid),
         }
     }
-    
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Куплю RUB - отдам USDT", callback_data="dir:buy_rub")],
         [InlineKeyboardButton("Продам RUB - возьму USDT", callback_data="dir:sell_rub")]
     ])
-    
     await update.message.reply_text(
         "🏗 Создание заявки\n\nВыберите направление:",
         reply_markup=keyboard
