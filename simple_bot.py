@@ -45,6 +45,8 @@ except ImportError as e:
     class ContextTypes:
         DEFAULT_TYPE = None
 
+import templates_store
+
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x)
@@ -221,6 +223,7 @@ def load_state() -> Dict[str, Any]:
     data.setdefault("merchant_stats", {})
     data.setdefault("deals", [])
     data.setdefault("ratings", {})
+    data.setdefault("templates", {})
 
     # Самолечение мигрировавших групп: если чат с известным именем висит под старым id,
     # переносим его на актуальный id из DEFAULT_CHATS (иначе ломается дедупликация отправки).
@@ -398,6 +401,17 @@ def lookup_username(state: Dict[str, Any], user_id: int) -> str:
     return str(user_id)
 
 # ─── End Partner/Merchant stats helpers ───────────────────────────────────
+
+def build_order_control_keyboard(bid: str) -> InlineKeyboardMarkup:
+    """Клавиатура управления заявкой в личке мерчанта (сводка после публикации)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
+        [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
+        [InlineKeyboardButton("💾 В шаблон", callback_data=f"tpl:save:{bid}")],
+        [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
+        [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
+    ])
+
 
 def build_keyboard(bid: str, state: Dict[str, Any], chat_id: int = None, user_id: int = None):
     order = state["orders"].get(bid)
@@ -1270,7 +1284,28 @@ async def create_order_start(update: Update, context):
         await update.message.reply_text("Только админы и мерчанты могут создавать заявки.")
         return
     
-    # Initialize user session
+    templates = templates_store.list_templates(state, uid)
+    if templates:
+        user_sessions[uid] = {
+            "step": "choose_template",
+            "data": {
+                "creator_id": uid,
+                "creator_username": getattr(update.effective_user, 'username', None) or str(uid),
+            }
+        }
+        buttons = [
+            [InlineKeyboardButton(f"📋 {t['name']}", callback_data=f"tpl:use:{i}")]
+            for i, t in enumerate(templates)
+        ]
+        buttons.append([InlineKeyboardButton("➕ Новую с нуля", callback_data="tpl:new")])
+        buttons.append([InlineKeyboardButton("✖️ Отмена", callback_data="tpl:cancel")])
+        await update.message.reply_text(
+            "🏗 Создать заявку\n\nВыбери шаблон или создай новую:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # Нет шаблонов — обычный флоу с выбора направления
     user_sessions[uid] = {
         "step": "direction",
         "data": {
@@ -1278,16 +1313,107 @@ async def create_order_start(update: Update, context):
             "creator_username": getattr(update.effective_user, 'username', None) or str(uid),
         }
     }
-    
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Куплю RUB - отдам USDT", callback_data="dir:buy_rub")],
         [InlineKeyboardButton("Продам RUB - возьму USDT", callback_data="dir:sell_rub")]
     ])
-    
     await update.message.reply_text(
         "🏗 Создание заявки\n\nВыберите направление:",
         reply_markup=keyboard
     )
+
+
+async def handle_template_callback(update: Update, context, state: Dict[str, Any], data: str):
+    q = update.callback_query
+    uid = q.from_user.id
+    parts = data.split(":")  # tpl:use:0 / tpl:new / tpl:save:{bid} / ...
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "new":
+        user_sessions[uid] = {
+            "step": "direction",
+            "data": {
+                "creator_id": uid,
+                "creator_username": q.from_user.username or str(uid),
+            }
+        }
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Куплю RUB - отдам USDT", callback_data="dir:buy_rub")],
+            [InlineKeyboardButton("Продам RUB - возьму USDT", callback_data="dir:sell_rub")]
+        ])
+        await q.edit_message_text("🏗 Создание заявки\n\nВыберите направление:", reply_markup=keyboard)
+        return
+
+    if action == "use":
+        try:
+            index = int(parts[2])
+        except (IndexError, ValueError):
+            await q.edit_message_text("❌ Шаблон не найден. Открой /create заново.")
+            return
+        tpl = templates_store.get_template(state, uid, index)
+        if not tpl:
+            await q.edit_message_text("❌ Шаблон не найден. Открой /create заново.")
+            return
+        # Защита (М3): шаблон без обязательного поля сломал бы finalize/schedule_expiration.
+        required = ("direction", "bank", "rate", "ttl_min")
+        if any(tpl.get(f) is None for f in required):
+            await q.edit_message_text(
+                "❌ Шаблон повреждён (не хватает полей). Удали его через /templates и создай заново."
+            )
+            return
+        user_sessions[uid] = {
+            "step": "template_amount",
+            "data": {
+                "creator_id": uid,
+                "creator_username": q.from_user.username or str(uid),
+                "direction": tpl.get("direction"),
+                "bank": tpl.get("bank"),
+                "payments": tpl.get("payments", ""),
+                "rate": tpl.get("rate"),
+                "ttl_min": tpl.get("ttl_min"),
+            }
+        }
+        await q.edit_message_text(
+            f"📋 Шаблон «{escape_html(tpl['name'])}»\n\n💰 Введи сумму в RUB (только число):",
+            parse_mode=safe_parse_mode()
+        )
+        return
+
+    if action == "save":
+        bid = parts[2] if len(parts) > 2 else ""
+        order = state["orders"].get(bid)
+        if not order:
+            await q.edit_message_text("❌ Заявка закрыта, шаблон не сохранить.")
+            return
+        snapshot = templates_store.snapshot_from_order(order)
+        user_sessions[uid] = {
+            "step": "template_name",
+            "data": {"tpl_snapshot": snapshot},
+        }
+        await q.edit_message_text("💾 Введи имя шаблона (до 30 символов):")
+        return
+
+    if action == "overwrite":
+        session = user_sessions.get(uid)
+        if not session or "pending_name" not in session.get("data", {}):
+            await q.edit_message_text("❌ Нечего перезаписывать. Начни заново через заявку.")
+            return
+        name = session["data"]["pending_name"]
+        snapshot = session["data"].get("tpl_snapshot", {})
+        templates_store.add_template(state, uid, name, snapshot, overwrite=True)
+        save_state(state)
+        del user_sessions[uid]
+        await q.edit_message_text(
+            f"✅ Шаблон «{escape_html(name)}» перезаписан.", parse_mode=safe_parse_mode()
+        )
+        return
+
+    if action == "cancel":
+        user_sessions.pop(uid, None)
+        await q.edit_message_text("✖️ Отменено.")
+        return
+
+    await handle_template_manage_callback(update, context, state, data, action, parts)
 
 
 async def schedule_expiration(context, bid: str, ttl_min: int):
@@ -1587,19 +1713,18 @@ async def on_callback(update: Update, context):
         await q.answer()
     except Exception:
         pass  # Игнорируем ошибки timeout или устаревших query
-    
+
+    if data.startswith("tpl:"):
+        await handle_template_callback(update, context, state, data)
+        return
+
     # Обрабатываем кнопку назад при редактировании суммы
     if data.startswith("back_to_control:") and uid in user_sessions and user_sessions[uid].get("state") == "editing_amount":
         bid = data.replace("back_to_control:", "")
         del user_sessions[uid]
         
         # Возвращаемся к управлению заявкой
-        control_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
-            [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
-            [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
-            [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
-        ])
+        control_keyboard = build_order_control_keyboard(bid)
         
         await q.edit_message_text(
             "❌ Редактирование суммы отменено.",
@@ -2350,6 +2475,38 @@ async def cmd_history(update: Update, context) -> None:
 
 # ─── /stats command ────────────────────────────────────────────────────────
 
+async def templates_cmd(update: Update, context) -> None:
+    """/templates — просмотр/переименование/удаление шаблонов."""
+    if not check_private_chat_only(update):
+        return
+    state = load_state()
+    uid = update.effective_user.id
+    if not await check_not_banned(update, state):
+        return
+    if not can_create_orders(uid, state):
+        await update.message.reply_text("❌ Команда для мерчантов и админов.")
+        return
+    await _render_templates_list(update.message.reply_text, state, uid)
+
+
+async def _render_templates_list(send_func, state, uid):
+    templates = templates_store.list_templates(state, uid)
+    if not templates:
+        await send_func("У тебя пока нет шаблонов.\nСоздай заявку и нажми «💾 В шаблон».")
+        return
+    lines = ["📋 <b>Твои шаблоны:</b>\n"]
+    buttons = []
+    for i, t in enumerate(templates):
+        lines.append(f"{i + 1}. {escape_html(t['name'])} — {escape_html(str(t.get('direction', '')))}")
+        buttons.append([
+            InlineKeyboardButton(f"✏️ {t['name'][:15]}", callback_data=f"tpl:rename:{i}"),
+            InlineKeyboardButton("🗑", callback_data=f"tpl:del:{i}"),
+        ])
+    await send_func(
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode=safe_parse_mode()
+    )
+
+
 async def cmd_stats(update: Update, context) -> None:
     """/stats — расширенная статистика для админов с топом партнёров."""
     if not check_private_chat_only(update):
@@ -2729,6 +2886,16 @@ async def show_ttl_selection(q):
         reply_markup=keyboard
     )
 
+def build_chat_keyboard(available_chats, state, include_back=True):
+    """Клавиатура выбора целевых чатов: 'Все чаты' + по чату + опц. 'Назад'."""
+    buttons = [[InlineKeyboardButton("Все чаты", callback_data="chat:all")]]
+    for chat_id in available_chats[:30]:
+        chat_name = state["chats"].get(str(chat_id), {}).get("name", f"Чат {chat_id}")
+        buttons.append([InlineKeyboardButton(f"📍 {chat_name}", callback_data=f"chat:{chat_id}")])
+    if include_back:
+        buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(buttons)
+
 async def show_chat_selection(q, context, uid: int, state: Dict[str, Any]):
     available_chats = await get_user_chats(uid, state, context.bot)
     
@@ -2754,17 +2921,7 @@ async def show_chat_selection(q, context, uid: int, state: Dict[str, Any]):
         await finalize_order_creation(q, context, uid, state)
         return
     
-    buttons = [[InlineKeyboardButton("Все чаты", callback_data="chat:all")]]
-    # Получаем названия чатов для отображения
-    for chat_id in available_chats[:30]:  # Limit to 30 chats for UI
-        chat_key = str(chat_id)
-        chat_name = state["chats"].get(chat_key, {}).get("name", f"Чат {chat_id}")
-        buttons.append([InlineKeyboardButton(f"📍 {chat_name}", callback_data=f"chat:{chat_id}")])
-    
-    # Добавляем кнопку "Назад"
-    buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back")])
-    
-    keyboard = InlineKeyboardMarkup(buttons)
+    keyboard = build_chat_keyboard(available_chats, state, include_back=True)
     await q.edit_message_text(
         "🎯 Выберите целевые чаты:",
         reply_markup=keyboard
@@ -2871,12 +3028,7 @@ async def finalize_order_creation(q, context, uid: int, state: Dict[str, Any]):
     )
     
     # Кнопки для управления заявкой
-    control_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
-        [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
-        [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
-        [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
-    ])
+    control_keyboard = build_order_control_keyboard(bid)
     
     # Отправляем сводное сообщение и сохраняем его ID для дальнейших операций
     bot_message = await q.edit_message_text(summary, reply_markup=control_keyboard)
@@ -3080,7 +3232,85 @@ async def handle_message(update: Update, context):
             )
         except ValueError:
             await update.message.reply_text("❌ Неверный формат курса. Введите число (например: 81 или 81.5)\n\nДля возврата введите /back")
-    
+
+    elif session["step"] == "template_amount":
+        try:
+            amount = int(text.replace(",", "").replace(" ", ""))
+            if amount <= 0:
+                raise ValueError("Amount must be positive")
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Неверный формат. Введите сумму числом (например: 150000)"
+            )
+            return
+        session["data"]["amount"] = amount
+        state = load_state()
+        available_chats = await get_user_chats(uid, state, context.bot)
+        if len(available_chats) == 0:
+            await update.message.reply_text(
+                "❌ Нет доступных чатов. Обратитесь к админу для регистрации чатов."
+            )
+            del user_sessions[uid]
+            return
+        session["step"] = "chats"
+        keyboard = build_chat_keyboard(available_chats, state, include_back=False)
+        await update.message.reply_text("🎯 Выберите целевые чаты:", reply_markup=keyboard)
+        return
+
+    elif session["step"] == "template_name":
+        ok, res = templates_store.validate_name(text)
+        if not ok:
+            msg = "❌ Имя не может быть пустым." if res == "empty" else "❌ Имя слишком длинное (макс. 30 символов)."
+            await update.message.reply_text(msg + " Введи имя ещё раз:")
+            return
+        snapshot = session["data"].get("tpl_snapshot", {})
+        state = load_state()
+        ok_add, code = templates_store.add_template(state, uid, res, snapshot, overwrite=False)
+        if not ok_add and code == "exists":
+            session["data"]["pending_name"] = res
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("♻️ Перезаписать", callback_data="tpl:overwrite")],
+                [InlineKeyboardButton("✖️ Отмена", callback_data="tpl:cancel")],
+            ])
+            await update.message.reply_text(
+                f"⚠️ Шаблон «{escape_html(res)}» уже есть. Перезаписать?",
+                reply_markup=keyboard, parse_mode=safe_parse_mode()
+            )
+            return
+        if not ok_add and code == "limit":
+            await update.message.reply_text(
+                f"❌ Достигнут лимит {templates_store.MAX_TEMPLATES} шаблонов. Удали лишний через /templates."
+            )
+            del user_sessions[uid]
+            return
+        save_state(state)
+        del user_sessions[uid]
+        await update.message.reply_text(
+            f"✅ Шаблон «{escape_html(res)}» сохранён. Теперь /create предложит его.",
+            parse_mode=safe_parse_mode()
+        )
+        return
+
+    elif session["step"] == "template_rename":
+        state = load_state()
+        index = session["data"].get("rename_index")
+        ok, code = templates_store.rename_template(state, uid, index, text)
+        if not ok:
+            msgs = {
+                "empty": "❌ Имя не может быть пустым.",
+                "too_long": "❌ Имя слишком длинное (макс. 30 символов).",
+                "exists": "❌ Шаблон с таким именем уже есть.",
+                "not_found": "❌ Шаблон не найден.",
+            }
+            await update.message.reply_text(msgs.get(code, "❌ Ошибка.") + " Попробуй ещё раз или /templates.")
+            if code == "not_found":
+                del user_sessions[uid]
+            return
+        save_state(state)
+        del user_sessions[uid]
+        await update.message.reply_text("✅ Шаблон переименован.")
+        return
+
     # Обработка команды /back для возврата к предыдущему шагу
     if text == "/back" and uid in user_sessions:
         session = user_sessions[uid]
@@ -3631,12 +3861,7 @@ async def handle_back_to_control(update: Update, context, state: Dict[str, Any],
         )
     
     # Кнопки управления
-    control_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
-        [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
-        [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
-        [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
-    ])
+    control_keyboard = build_order_control_keyboard(bid)
     
     await q.edit_message_text(summary, reply_markup=control_keyboard)
 
@@ -3771,12 +3996,7 @@ async def handle_amount_edit_input(update: Update, context, uid: int, state: Dic
         )
         
         # Восстанавливаем кнопки управления
-        control_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
-            [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
-            [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
-            [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
-        ])
+        control_keyboard = build_order_control_keyboard(bid)
         
         await update.message.reply_text(success_text, reply_markup=control_keyboard)
         
@@ -3846,6 +4066,7 @@ async def set_user_commands(bot, user_id: int, role: str):
     merchant_commands = [
         BotCommand("create", "Создать заявку"),
         BotCommand("myorders", "Мои активные заявки"),
+        BotCommand("templates", "Мои шаблоны заявок"),
         BotCommand("partner", "Карточка партнёра"),
         BotCommand("history", "История сделок"),
         BotCommand("timezone", "Часовой пояс"),
@@ -3855,6 +4076,7 @@ async def set_user_commands(bot, user_id: int, role: str):
     admin_commands = [
         BotCommand("create", "Создать заявку"),
         BotCommand("myorders", "Мои активные заявки"),
+        BotCommand("templates", "Мои шаблоны заявок"),
         BotCommand("partner", "Карточка партнёра"),
         BotCommand("history", "История сделок"),
         BotCommand("timezone", "Часовой пояс"),
@@ -3986,6 +4208,7 @@ async def main():
         _app.add_handler(CommandHandler("addmerchant", cmd_addmerchant))
         _app.add_handler(CommandHandler("removemerchant", cmd_removemerchant))
         _app.add_handler(CommandHandler("merchants", cmd_listmerchants))
+        _app.add_handler(CommandHandler("templates", templates_cmd))
         _app.add_handler(CallbackQueryHandler(on_callback))
         _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         _app.add_handler(MessageHandler(filters.COMMAND, unknown))
@@ -4167,12 +4390,7 @@ async def handle_republish_order(update: Update, context, state: Dict[str, Any],
         f"Срок: {escape_html(format_ttl_display(order_data['ttl_min']))}\n\n"
         f"Отправлено в чатов: {ok}, ошибок: {fail}"
     )
-    control_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{new_bid}")],
-        [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{new_bid}")],
-        [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{new_bid}")],
-        [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{new_bid}")]
-    ])
+    control_keyboard = build_order_control_keyboard(new_bid)
     try:
         new_bot_message = await context.bot.send_message(
             chat_id=uid,
@@ -4276,6 +4494,60 @@ async def handle_close_claimed_expired_order(update: Update, context, state: Dic
         logger.error(f"[close_claimed_expired] edit failed: {e}")
 
     await _close_order_from_chats(bid, state, context.bot, skip_bot_msg=True)
+
+
+async def handle_template_manage_callback(update, context, state, data, action, parts):
+    q = update.callback_query
+    uid = q.from_user.id
+
+    def _index():
+        try:
+            return int(parts[2])
+        except (IndexError, ValueError):
+            return None
+
+    if action == "rename":
+        index = _index()
+        tpl = templates_store.get_template(state, uid, index) if index is not None else None
+        if not tpl:
+            await q.edit_message_text("❌ Шаблон не найден. Открой /templates заново.")
+            return
+        user_sessions[uid] = {"step": "template_rename", "data": {"rename_index": index}}
+        await q.edit_message_text(
+            f"✏️ Введи новое имя для «{escape_html(tpl['name'])}» (до 30 символов):",
+            parse_mode=safe_parse_mode()
+        )
+        return
+
+    if action == "del":
+        index = _index()
+        tpl = templates_store.get_template(state, uid, index) if index is not None else None
+        if not tpl:
+            await q.edit_message_text("❌ Шаблон не найден. Открой /templates заново.")
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"tpl:delok:{index}")],
+            [InlineKeyboardButton("✖️ Отмена", callback_data="tpl:delno")],
+        ])
+        await q.edit_message_text(
+            f"Удалить шаблон «{escape_html(tpl['name'])}»?",
+            reply_markup=keyboard, parse_mode=safe_parse_mode()
+        )
+        return
+
+    if action == "delok":
+        index = _index()
+        if index is None or not templates_store.delete_template(state, uid, index):
+            await q.edit_message_text("❌ Шаблон не найден.")
+            return
+        save_state(state)
+        await q.edit_message_text("🗑 Шаблон удалён.")
+        return
+
+    if action == "delno":
+        await q.edit_message_text("✖️ Удаление отменено.")
+        return
+
 
 if __name__ == "__main__":
     asyncio.run(main())
