@@ -416,7 +416,6 @@ def build_order_control_keyboard(bid: str, in_template: bool = False) -> InlineK
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
         [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
-        [InlineKeyboardButton("⏰ Продлить на 30 мин", callback_data=f"extend:{bid}")],
         [tpl_button],
         [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
         [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
@@ -1839,10 +1838,6 @@ async def on_callback(update: Update, context):
     
     if action == "edit_amount":
         await handle_edit_amount(update, context, state, bid)
-        return
-
-    if action == "extend":
-        await handle_extend_ttl(update, context, state, bid)
         return
 
     if action == "send_remaining":
@@ -3912,76 +3907,6 @@ async def handle_back_to_control(update: Update, context, state: Dict[str, Any],
     control_keyboard = build_order_control_keyboard(bid)
     
     await q.edit_message_text(summary, reply_markup=control_keyboard)
-
-MAX_TTL_EXTENSIONS = 3
-
-
-async def handle_extend_ttl(update: Update, context, state: Dict[str, Any], bid: str):
-    """Продлевает срок активной заявки на 30 минут (до MAX_TTL_EXTENSIONS раз).
-
-    on_callback уже вызвал q.answer() до роутинга — повторный alert не сработает,
-    поэтому подтверждение и ошибки шлём отдельным сообщением в личку мерчанта."""
-    q = update.callback_query
-    uid = q.from_user.id
-    order = state["orders"].get(bid)
-
-    if not order:
-        await q.message.reply_text("❌ Заявка не найдена.")
-        return
-    if order.get("expired"):
-        await q.message.reply_text("⏰ Заявка уже истекла — используй «Переопубликовать».")
-        return
-    if uid != order.get("creator_id") and not is_admin(uid, state):
-        await q.message.reply_text("❌ Продлить может только создатель заявки.")
-        return
-    used = order.get("extensions", 0)
-    if used >= MAX_TTL_EXTENSIONS:
-        await q.message.reply_text(f"❌ Достигнут лимит продлений ({MAX_TTL_EXTENSIONS}).")
-        return
-
-    now = datetime.now(timezone.utc)
-    # Новый дедлайн = текущий дедлайн истечения + 30 мин. Берём время из job'а expire.
-    base_deadline = None
-    if hasattr(context, 'job_queue') and context.job_queue:
-        for j in context.job_queue.get_jobs_by_name(f"expire:{bid}"):
-            nt = getattr(j, "next_t", None)
-            if nt is not None:
-                base_deadline = nt
-            j.schedule_removal()
-    if base_deadline is None:
-        base_deadline = now
-    delay = (base_deadline + timedelta(minutes=30) - now).total_seconds()
-    if delay < 60:
-        delay = 30 * 60
-    if hasattr(context, 'job_queue') and context.job_queue:
-        context.job_queue.run_once(expire_job, when=delay, data={"bid": bid}, name=f"expire:{bid}")
-
-    order["extensions"] = used + 1
-    order["ttl_min"] = order.get("ttl_min", 0) + 30
-    save_state(state)
-
-    # Обновляем сообщения заявки во всех групповых чатах (новый срок в карточке)
-    creator = order.get("creator_id")
-    for msg in order.get("messages", []):
-        try:
-            await edit_message_safe(
-                context.bot,
-                chat_id=msg["chat_id"],
-                message_id=msg["message_id"],
-                text=render_message(bid, state, msg["chat_id"], creator),
-                reply_markup=build_keyboard(bid, state, msg["chat_id"], creator),
-                parse_mode=safe_parse_mode(),
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            pass
-
-    remaining = MAX_TTL_EXTENSIONS - order["extensions"]
-    await q.message.reply_text(
-        f"✅ Заявка продлена на 30 минут. Новый срок: {format_ttl_display(order['ttl_min'])}. "
-        f"Осталось продлений: {remaining}."
-    )
-
 
 async def handle_edit_amount(update: Update, context, state: Dict[str, Any], bid: str):
     """Обрабатывает редактирование суммы заявки"""
