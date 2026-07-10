@@ -1323,6 +1323,66 @@ async def create_order_start(update: Update, context):
     )
 
 
+async def handle_template_callback(update: Update, context, state: Dict[str, Any], data: str):
+    q = update.callback_query
+    uid = q.from_user.id
+    parts = data.split(":")  # tpl:use:0 / tpl:new / tpl:save:{bid} / ...
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "new":
+        user_sessions[uid] = {
+            "step": "direction",
+            "data": {
+                "creator_id": uid,
+                "creator_username": q.from_user.username or str(uid),
+            }
+        }
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Куплю RUB - отдам USDT", callback_data="dir:buy_rub")],
+            [InlineKeyboardButton("Продам RUB - возьму USDT", callback_data="dir:sell_rub")]
+        ])
+        await q.edit_message_text("🏗 Создание заявки\n\nВыберите направление:", reply_markup=keyboard)
+        return
+
+    if action == "use":
+        try:
+            index = int(parts[2])
+        except (IndexError, ValueError):
+            await q.edit_message_text("❌ Шаблон не найден. Открой /create заново.")
+            return
+        tpl = templates_store.get_template(state, uid, index)
+        if not tpl:
+            await q.edit_message_text("❌ Шаблон не найден. Открой /create заново.")
+            return
+        # Защита (М3): шаблон без обязательного поля сломал бы finalize/schedule_expiration.
+        required = ("direction", "bank", "rate", "ttl_min")
+        if any(tpl.get(f) is None for f in required):
+            await q.edit_message_text(
+                "❌ Шаблон повреждён (не хватает полей). Удали его через /templates и создай заново."
+            )
+            return
+        user_sessions[uid] = {
+            "step": "template_amount",
+            "data": {
+                "creator_id": uid,
+                "creator_username": q.from_user.username or str(uid),
+                "direction": tpl.get("direction"),
+                "bank": tpl.get("bank"),
+                "payments": tpl.get("payments", ""),
+                "rate": tpl.get("rate"),
+                "ttl_min": tpl.get("ttl_min"),
+            }
+        }
+        await q.edit_message_text(
+            f"📋 Шаблон «{escape_html(tpl['name'])}»\n\n💰 Введи сумму в RUB (только число):",
+            parse_mode=safe_parse_mode()
+        )
+        return
+
+    # save / rename / del / overwrite / delok / delno — добавляются в Tasks 7-9
+    await handle_template_manage_callback(update, context, state, data, action, parts)
+
+
 async def schedule_expiration(context, bid: str, ttl_min: int):
     if hasattr(context, 'job_queue') and context.job_queue:
         context.job_queue.run_once(expire_job, when=timedelta(minutes=ttl_min), data={"bid": bid}, name=f"expire:{bid}")
@@ -1620,7 +1680,11 @@ async def on_callback(update: Update, context):
         await q.answer()
     except Exception:
         pass  # Игнорируем ошибки timeout или устаревших query
-    
+
+    if data.startswith("tpl:"):
+        await handle_template_callback(update, context, state, data)
+        return
+
     # Обрабатываем кнопку назад при редактировании суммы
     if data.startswith("back_to_control:") and uid in user_sessions and user_sessions[uid].get("state") == "editing_amount":
         bid = data.replace("back_to_control:", "")
@@ -4284,6 +4348,11 @@ async def handle_close_claimed_expired_order(update: Update, context, state: Dic
         logger.error(f"[close_claimed_expired] edit failed: {e}")
 
     await _close_order_from_chats(bid, state, context.bot, skip_bot_msg=True)
+
+
+async def handle_template_manage_callback(update, context, state, data, action, parts):
+    await update.callback_query.edit_message_text("⚙️ В разработке.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
