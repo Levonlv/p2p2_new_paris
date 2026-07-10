@@ -3167,7 +3167,31 @@ async def handle_message(update: Update, context):
             )
         except ValueError:
             await update.message.reply_text("❌ Неверный формат курса. Введите число (например: 81 или 81.5)\n\nДля возврата введите /back")
-    
+
+    elif session["step"] == "template_amount":
+        try:
+            amount = int(text.replace(",", "").replace(" ", ""))
+            if amount <= 0:
+                raise ValueError("Amount must be positive")
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Неверный формат. Введите сумму числом (например: 150000)"
+            )
+            return
+        session["data"]["amount"] = amount
+        state = load_state()
+        available_chats = await get_user_chats(uid, state, context.bot)
+        if len(available_chats) == 0:
+            await update.message.reply_text(
+                "❌ Нет доступных чатов. Обратитесь к админу для регистрации чатов."
+            )
+            del user_sessions[uid]
+            return
+        session["step"] = "chats"
+        keyboard = build_chat_keyboard(available_chats, state, include_back=False)
+        await update.message.reply_text("🎯 Выберите целевые чаты:", reply_markup=keyboard)
+        return
+
     # Обработка команды /back для возврата к предыдущему шагу
     if text == "/back" and uid in user_sessions:
         session = user_sessions[uid]
