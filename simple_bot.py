@@ -402,12 +402,21 @@ def lookup_username(state: Dict[str, Any], user_id: int) -> str:
 
 # ─── End Partner/Merchant stats helpers ───────────────────────────────────
 
-def build_order_control_keyboard(bid: str) -> InlineKeyboardMarkup:
-    """Клавиатура управления заявкой в личке мерчанта (сводка после публикации)."""
+def build_order_control_keyboard(bid: str, in_template: bool = False) -> InlineKeyboardMarkup:
+    """Клавиатура управления заявкой в личке мерчанта (сводка после публикации).
+
+    in_template=True — заявка уже сохранена в шаблон: кнопка «В шаблон» заменяется
+    неактивной галочкой «✅ В шаблоне», остальные кнопки управления остаются.
+    """
+    tpl_button = (
+        InlineKeyboardButton("✅ В шаблоне", callback_data="tpl:noop")
+        if in_template else
+        InlineKeyboardButton("💾 В шаблон", callback_data=f"tpl:save:{bid}")
+    )
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
         [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
-        [InlineKeyboardButton("💾 В шаблон", callback_data=f"tpl:save:{bid}")],
+        [tpl_button],
         [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
         [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
     ])
@@ -1379,18 +1388,24 @@ async def handle_template_callback(update: Update, context, state: Dict[str, Any
         )
         return
 
+    if action == "noop":
+        # Кнопка-индикатор «✅ В шаблоне» — нажатие ничего не делает.
+        return
+
     if action == "save":
         bid = parts[2] if len(parts) > 2 else ""
         order = state["orders"].get(bid)
         if not order:
-            await q.edit_message_text("❌ Заявка закрыта, шаблон не сохранить.")
+            await q.message.reply_text("❌ Заявка закрыта, шаблон не сохранить.")
             return
         snapshot = templates_store.snapshot_from_order(order)
         user_sessions[uid] = {
             "step": "template_name",
-            "data": {"tpl_snapshot": snapshot},
+            "data": {"tpl_snapshot": snapshot, "src_bid": bid},
         }
-        await q.edit_message_text("💾 Введи имя шаблона (до 30 символов):")
+        # НЕ трогаем карточку заявки (её кнопки управления должны остаться) —
+        # запрашиваем имя отдельным сообщением.
+        await q.message.reply_text("💾 Введи имя шаблона (до 30 символов):")
         return
 
     if action == "overwrite":
@@ -1400,9 +1415,11 @@ async def handle_template_callback(update: Update, context, state: Dict[str, Any
             return
         name = session["data"]["pending_name"]
         snapshot = session["data"].get("tpl_snapshot", {})
+        src_bid = session["data"].get("src_bid")
         templates_store.add_template(state, uid, name, snapshot, overwrite=True)
         save_state(state)
         del user_sessions[uid]
+        await _mark_order_in_template(context, state, src_bid)
         await q.edit_message_text(
             f"✅ Шаблон «{escape_html(name)}» перезаписан.", parse_mode=safe_parse_mode()
         )
@@ -1414,6 +1431,30 @@ async def handle_template_callback(update: Update, context, state: Dict[str, Any
         return
 
     await handle_template_manage_callback(update, context, state, data, action, parts)
+
+
+async def _mark_order_in_template(context, state, bid):
+    """Ставит галочку «✅ В шаблоне» на карточке заявки в личке, сохраняя кнопки.
+
+    Карточка заявки живёт по order['bot_message_id']/['bot_chat_id']. Если заявка
+    уже закрыта или id нет — молча пропускаем (не критично)."""
+    if not bid:
+        return
+    order = state.get("orders", {}).get(bid)
+    if not order:
+        return
+    msg_id = order.get("bot_message_id")
+    chat_id = order.get("bot_chat_id")
+    if not msg_id or not chat_id:
+        return
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=msg_id,
+            reply_markup=build_order_control_keyboard(bid, in_template=True),
+        )
+    except Exception:
+        pass
 
 
 async def schedule_expiration(context, bid: str, ttl_min: int):
@@ -3284,7 +3325,9 @@ async def handle_message(update: Update, context):
             del user_sessions[uid]
             return
         save_state(state)
+        src_bid = session["data"].get("src_bid")
         del user_sessions[uid]
+        await _mark_order_in_template(context, state, src_bid)
         await update.message.reply_text(
             f"✅ Шаблон «{escape_html(res)}» сохранён. Теперь /create предложит его.",
             parse_mode=safe_parse_mode()
