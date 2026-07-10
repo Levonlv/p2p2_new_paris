@@ -402,6 +402,17 @@ def lookup_username(state: Dict[str, Any], user_id: int) -> str:
 
 # ─── End Partner/Merchant stats helpers ───────────────────────────────────
 
+def build_order_control_keyboard(bid: str) -> InlineKeyboardMarkup:
+    """Клавиатура управления заявкой в личке мерчанта (сводка после публикации)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
+        [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
+        [InlineKeyboardButton("💾 В шаблон", callback_data=f"tpl:save:{bid}")],
+        [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
+        [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
+    ])
+
+
 def build_keyboard(bid: str, state: Dict[str, Any], chat_id: int = None, user_id: int = None):
     order = state["orders"].get(bid)
     if not order or order.get("expired", False): 
@@ -1597,12 +1608,7 @@ async def on_callback(update: Update, context):
         del user_sessions[uid]
         
         # Возвращаемся к управлению заявкой
-        control_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
-            [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
-            [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
-            [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
-        ])
+        control_keyboard = build_order_control_keyboard(bid)
         
         await q.edit_message_text(
             "❌ Редактирование суммы отменено.",
@@ -2874,12 +2880,7 @@ async def finalize_order_creation(q, context, uid: int, state: Dict[str, Any]):
     )
     
     # Кнопки для управления заявкой
-    control_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
-        [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
-        [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
-        [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
-    ])
+    control_keyboard = build_order_control_keyboard(bid)
     
     # Отправляем сводное сообщение и сохраняем его ID для дальнейших операций
     bot_message = await q.edit_message_text(summary, reply_markup=control_keyboard)
@@ -3634,12 +3635,7 @@ async def handle_back_to_control(update: Update, context, state: Dict[str, Any],
         )
     
     # Кнопки управления
-    control_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
-        [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
-        [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
-        [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
-    ])
+    control_keyboard = build_order_control_keyboard(bid)
     
     await q.edit_message_text(summary, reply_markup=control_keyboard)
 
@@ -3774,12 +3770,7 @@ async def handle_amount_edit_input(update: Update, context, uid: int, state: Dic
         )
         
         # Восстанавливаем кнопки управления
-        control_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{bid}")],
-            [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{bid}")],
-            [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{bid}")],
-            [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{bid}")]
-        ])
+        control_keyboard = build_order_control_keyboard(bid)
         
         await update.message.reply_text(success_text, reply_markup=control_keyboard)
         
@@ -4170,12 +4161,7 @@ async def handle_republish_order(update: Update, context, state: Dict[str, Any],
         f"Срок: {escape_html(format_ttl_display(order_data['ttl_min']))}\n\n"
         f"Отправлено в чатов: {ok}, ошибок: {fail}"
     )
-    control_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔔 Напомнить о заявке", callback_data=f"remind_bot:{new_bid}")],
-        [InlineKeyboardButton("📝 Редактировать сумму", callback_data=f"edit_amount:{new_bid}")],
-        [InlineKeyboardButton("📤 Отправить в оставшиеся чаты", callback_data=f"send_remaining:{new_bid}")],
-        [InlineKeyboardButton("🗑️ Закрыть заявку", callback_data=f"close:{new_bid}")]
-    ])
+    control_keyboard = build_order_control_keyboard(new_bid)
     try:
         new_bot_message = await context.bot.send_message(
             chat_id=uid,
