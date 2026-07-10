@@ -2738,6 +2738,16 @@ async def show_ttl_selection(q):
         reply_markup=keyboard
     )
 
+def build_chat_keyboard(available_chats, state, include_back=True):
+    """Клавиатура выбора целевых чатов: 'Все чаты' + по чату + опц. 'Назад'."""
+    buttons = [[InlineKeyboardButton("Все чаты", callback_data="chat:all")]]
+    for chat_id in available_chats[:30]:
+        chat_name = state["chats"].get(str(chat_id), {}).get("name", f"Чат {chat_id}")
+        buttons.append([InlineKeyboardButton(f"📍 {chat_name}", callback_data=f"chat:{chat_id}")])
+    if include_back:
+        buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(buttons)
+
 async def show_chat_selection(q, context, uid: int, state: Dict[str, Any]):
     available_chats = await get_user_chats(uid, state, context.bot)
     
@@ -2763,17 +2773,7 @@ async def show_chat_selection(q, context, uid: int, state: Dict[str, Any]):
         await finalize_order_creation(q, context, uid, state)
         return
     
-    buttons = [[InlineKeyboardButton("Все чаты", callback_data="chat:all")]]
-    # Получаем названия чатов для отображения
-    for chat_id in available_chats[:30]:  # Limit to 30 chats for UI
-        chat_key = str(chat_id)
-        chat_name = state["chats"].get(chat_key, {}).get("name", f"Чат {chat_id}")
-        buttons.append([InlineKeyboardButton(f"📍 {chat_name}", callback_data=f"chat:{chat_id}")])
-    
-    # Добавляем кнопку "Назад"
-    buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back")])
-    
-    keyboard = InlineKeyboardMarkup(buttons)
+    keyboard = build_chat_keyboard(available_chats, state, include_back=True)
     await q.edit_message_text(
         "🎯 Выберите целевые чаты:",
         reply_markup=keyboard
