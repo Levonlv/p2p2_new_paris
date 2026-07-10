@@ -1379,7 +1379,40 @@ async def handle_template_callback(update: Update, context, state: Dict[str, Any
         )
         return
 
-    # save / rename / del / overwrite / delok / delno — добавляются в Tasks 7-9
+    if action == "save":
+        bid = parts[2] if len(parts) > 2 else ""
+        order = state["orders"].get(bid)
+        if not order:
+            await q.edit_message_text("❌ Заявка закрыта, шаблон не сохранить.")
+            return
+        snapshot = templates_store.snapshot_from_order(order)
+        user_sessions[uid] = {
+            "step": "template_name",
+            "data": {"tpl_snapshot": snapshot},
+        }
+        await q.edit_message_text("💾 Введи имя шаблона (до 30 символов):")
+        return
+
+    if action == "overwrite":
+        session = user_sessions.get(uid)
+        if not session or "pending_name" not in session.get("data", {}):
+            await q.edit_message_text("❌ Нечего перезаписывать. Начни заново через заявку.")
+            return
+        name = session["data"]["pending_name"]
+        snapshot = session["data"].get("tpl_snapshot", {})
+        templates_store.add_template(state, uid, name, snapshot, overwrite=True)
+        save_state(state)
+        del user_sessions[uid]
+        await q.edit_message_text(
+            f"✅ Шаблон «{escape_html(name)}» перезаписан.", parse_mode=safe_parse_mode()
+        )
+        return
+
+    if action == "cancel":
+        user_sessions.pop(uid, None)
+        await q.edit_message_text("✖️ Отменено.")
+        return
+
     await handle_template_manage_callback(update, context, state, data, action, parts)
 
 
@@ -3190,6 +3223,40 @@ async def handle_message(update: Update, context):
         session["step"] = "chats"
         keyboard = build_chat_keyboard(available_chats, state, include_back=False)
         await update.message.reply_text("🎯 Выберите целевые чаты:", reply_markup=keyboard)
+        return
+
+    elif session["step"] == "template_name":
+        ok, res = templates_store.validate_name(text)
+        if not ok:
+            msg = "❌ Имя не может быть пустым." if res == "empty" else "❌ Имя слишком длинное (макс. 30 символов)."
+            await update.message.reply_text(msg + " Введи имя ещё раз:")
+            return
+        snapshot = session["data"].get("tpl_snapshot", {})
+        state = load_state()
+        ok_add, code = templates_store.add_template(state, uid, res, snapshot, overwrite=False)
+        if not ok_add and code == "exists":
+            session["data"]["pending_name"] = res
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("♻️ Перезаписать", callback_data="tpl:overwrite")],
+                [InlineKeyboardButton("✖️ Отмена", callback_data="tpl:cancel")],
+            ])
+            await update.message.reply_text(
+                f"⚠️ Шаблон «{escape_html(res)}» уже есть. Перезаписать?",
+                reply_markup=keyboard, parse_mode=safe_parse_mode()
+            )
+            return
+        if not ok_add and code == "limit":
+            await update.message.reply_text(
+                f"❌ Достигнут лимит {templates_store.MAX_TEMPLATES} шаблонов. Удали лишний через /templates."
+            )
+            del user_sessions[uid]
+            return
+        save_state(state)
+        del user_sessions[uid]
+        await update.message.reply_text(
+            f"✅ Шаблон «{escape_html(res)}» сохранён. Теперь /create предложит его.",
+            parse_mode=safe_parse_mode()
+        )
         return
 
     # Обработка команды /back для возврата к предыдущему шагу
