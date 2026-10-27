@@ -3069,14 +3069,15 @@ async def show_ttl_selection(q):
     )
 
 def build_chat_keyboard(available_chats, state, include_back=True, main_chats=None):
-    """Клавиатура выбора целевых чатов: опц. 'Основные N' + 'Все чаты' + по чату + опц. 'Назад'."""
+    """Клавиатура выбора целевых чатов: опц. 'Основные N' + по чату + 'Во все чаты (N)' + опц. 'Назад'."""
     buttons = []
     if main_chats:
         buttons.append([InlineKeyboardButton(f"⚡ Основные {len(main_chats)}", callback_data="chat:main")])
-    buttons.append([InlineKeyboardButton("Все чаты", callback_data="chat:all")])
     for chat_id in available_chats[:30]:
         chat_name = state["chats"].get(str(chat_id), {}).get("name", f"Чат {chat_id}")
         buttons.append([InlineKeyboardButton(f"📍 {chat_name}", callback_data=f"chat:{chat_id}")])
+    # chat:all шлёт во все available_chats (без среза [:30]) — поэтому и счётчик по ним
+    buttons.append([InlineKeyboardButton(f"📢 Во все чаты ({len(available_chats)})", callback_data="chat:all")])
     if include_back:
         buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back")])
     return InlineKeyboardMarkup(buttons)
