@@ -66,6 +66,10 @@ DEFAULT_CHATS = {
     "-4662200552": {"id": -4662200552, "name": "тесты"}
 }
 
+# Пресет «Основные» — чаты, в которые заявка уходит одной кнопкой (только админу).
+# Дефолт — по именам; дальше список правится командой /mainchats и хранится в state["main_chats"].
+DEFAULT_MAIN_CHAT_NAMES = ["OTC", "акулы", "Levon&MP", "ZED"]
+
 # Order creation session storage
 user_sessions = {}
 
@@ -234,6 +238,8 @@ def load_state() -> Dict[str, Any]:
         if target and chat.get("id") != target["id"]:
             data["chats"].pop(old_key, None)
             data["chats"][str(target["id"])] = {"id": target["id"], "name": target["name"]}
+            if chat.get("id") in data.get("main_chats", []):
+                data["main_chats"] = [target["id"] if c == chat.get("id") else c for c in data["main_chats"]]
 
     # Автоматически добавляем предустановленные чаты
     # Проверяем по имени, чтобы не дублировать мигрировавшие группы (старый ID vs новый)
@@ -241,7 +247,12 @@ def load_state() -> Dict[str, Any]:
     for chat_key, chat_info in DEFAULT_CHATS.items():
         if chat_key not in data["chats"] and chat_info["name"] not in existing_names:
             data["chats"][chat_key] = chat_info.copy()
-    
+
+    # Пресет «Основные»: при первом запуске собираем из DEFAULT_MAIN_CHAT_NAMES по именам
+    if "main_chats" not in data:
+        by_name = {info.get("name"): info["id"] for info in data["chats"].values()}
+        data["main_chats"] = [by_name[n] for n in DEFAULT_MAIN_CHAT_NAMES if n in by_name]
+
     return data
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -268,6 +279,9 @@ def _migrate_chat_id(state: Dict[str, Any], old_id: int, new_id: int) -> None:
         chat_info = {"name": f"Чат {new_id}"}
     chat_info["id"] = new_id
     chats[str(new_id)] = chat_info
+    main = state.get("main_chats")
+    if main and old_id in main:
+        state["main_chats"] = [new_id if c == old_id else c for c in main]
 
 def _record_sent_message(state: Dict[str, Any], order: Dict[str, Any], requested_cid: int, msg) -> int:
     """Сохраняет отправленное сообщение в order["messages"]; при миграции группы
@@ -632,6 +646,26 @@ async def get_user_chats(user_id: int, state: Dict[str, Any], bot=None) -> List[
         return available_chats
     return []  # Обычные пользователи не могут создавать заявки
 
+def get_main_chats_for(uid: int, state: Dict[str, Any], available_chats: List[int]):
+    """Чаты пресета «Основные» для кнопки -> (чаты, подсказка). Только админу.
+    Если хоть один чат пресета не зарегистрирован или недоступен — чатов нет (кнопка
+    прячется), а подсказка объясняет почему. Порядок — как в реестре state["chats"]."""
+    if not is_admin(uid, state):
+        return [], ""
+    preset = state.get("main_chats", [])
+    if not preset:
+        return [], "⚡ Кнопка «Основные» не настроена — /mainchats"
+    chats = state.get("chats", {})
+    if any(str(c) not in chats for c in preset):
+        return [], "⚡ «Основные» скрыты: чат из пресета удалён из реестра — поправь /mainchats"
+    missing = [chats[str(c)]["name"] for c in preset if c not in available_chats]
+    if missing:
+        return [], f"⚡ «Основные» скрыты: нет доступа к {', '.join(missing)}"
+    return [info["id"] for info in chats.values() if info["id"] in preset], ""
+
+def chat_selection_text(hint: str) -> str:
+    return "🎯 Выберите целевые чаты:" + (f"\n\n{hint}" if hint else "")
+
 # Command handlers
 async def start(update: Update, context):
     if not check_private_chat_only(update):
@@ -751,6 +785,84 @@ async def timezone_cmd(update: Update, context):
             "Пример: /timezone 3"
         )
 
+def _normalize_main_chats(state: Dict[str, Any], selected) -> List[int]:
+    """Пресет в порядке реестра, только зарегистрированные чаты (мёртвые id выкидываются)."""
+    selected = set(selected)
+    return [info["id"] for info in state["chats"].values() if info["id"] in selected]
+
+def _main_chats_names(state: Dict[str, Any]) -> List[str]:
+    return [state["chats"][str(c)]["name"] for c in state.get("main_chats", []) if str(c) in state["chats"]]
+
+def _build_main_chats_view(state: Dict[str, Any]):
+    main = set(state.get("main_chats", []))
+    rows = []
+    for info in state["chats"].values():
+        mark = "✅" if info["id"] in main else "☐"
+        rows.append([InlineKeyboardButton(f"{mark} {info['name']}", callback_data=f"main:t:{info['id']}")])
+    rows.append([InlineKeyboardButton("✔️ Готово", callback_data="main:done")])
+    text = (
+        "⚡ <b>Основные чаты</b>\n\n"
+        "Отметь чаты, в которые уходит кнопка «Основные» при создании заявки. "
+        "Каждое нажатие сохраняется сразу. Кнопка видна только админам."
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+async def main_chats_cmd(update: Update, context):
+    if not check_private_chat_only(update):
+        return
+    state = load_state()
+    uid = update.effective_user.id
+    if not await check_not_banned(update, state):
+        return
+    if not is_admin(uid, state):
+        await update.message.reply_text("❌ Только админы могут менять основные чаты.")
+        return
+    if not state["chats"]:
+        await update.message.reply_text("❌ Нет зарегистрированных чатов. Сначала /register в нужной группе.")
+        return
+    # Чистим мёртвые id (чат удалён из реестра) — их не видно в списке и не снять галочкой
+    cleaned = _normalize_main_chats(state, state.get("main_chats", []))
+    if cleaned != state.get("main_chats"):
+        state["main_chats"] = cleaned
+        save_state(state)
+    text, kb = _build_main_chats_view(state)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+async def handle_main_chats_callback(update: Update, context, state: Dict[str, Any], data: str):
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_admin(uid, state):
+        return
+    if data == "main:done":
+        names = _main_chats_names(state)
+        if names:
+            text = f"✅ Основные ({len(names)}): {', '.join(names)}"
+        else:
+            text = "⚠️ Пресет пуст — кнопка «Основные» скрыта. Настроить: /mainchats"
+        try:
+            await q.edit_message_text(text)
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                logger.warning(f"/mainchats done edit failed: {e}")
+        return
+    if data.startswith("main:t:"):
+        try:
+            cid = int(data[len("main:t:"):])
+        except ValueError:
+            return
+        if str(cid) not in state["chats"]:
+            return
+        selected = set(state.get("main_chats", []))
+        selected ^= {cid}
+        state["main_chats"] = _normalize_main_chats(state, selected)
+        save_state(state)
+        text, kb = _build_main_chats_view(state)
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                logger.warning(f"/mainchats toggle edit failed: {e}")
+
 async def help_cmd(update: Update, context):
     if not check_private_chat_only(update):
         return
@@ -774,7 +886,8 @@ async def help_cmd(update: Update, context):
             "🏗 <b>Чаты:</b>\n"
             "/register [название] — зарегистрировать чат\n"
             "/unregister — убрать чат\n"
-            "/list — список чатов\n\n"
+            "/list — список чатов\n"
+            "/mainchats — настроить кнопку «Основные»\n\n"
             "👮 <b>Управление:</b>\n"
             "/admins — список админов и мерчантов\n"
             "/merchants — список мерчантов\n"
@@ -1251,8 +1364,12 @@ async def unregister_chat(update: Update, context):
     if chat_key in state["chats"]:
         chat_name = state["chats"][chat_key]["name"]
         del state["chats"][chat_key]
+        note = ""
+        if cid in state.get("main_chats", []):
+            state["main_chats"] = [c for c in state["main_chats"] if c != cid]
+            note = "\n⚡ Убран и из «Основных» — проверь /mainchats"
         save_state(state)
-        await update.message.reply_text(f"❌ Чат удалён: '{chat_name}' (ID: {cid})")
+        await update.message.reply_text(f"❌ Чат удалён: '{chat_name}' (ID: {cid}){note}")
     else: 
         await update.message.reply_text("Этого чата нет в списке.")
 
@@ -1757,6 +1874,10 @@ async def on_callback(update: Update, context):
 
     if data.startswith("tpl:"):
         await handle_template_callback(update, context, state, data)
+        return
+
+    if data.startswith("main:"):
+        await handle_main_chats_callback(update, context, state, data)
         return
 
     # Обрабатываем кнопку назад при редактировании суммы
@@ -2902,6 +3023,24 @@ async def handle_order_creation(update: Update, context, state: Dict[str, Any]):
         if data.startswith("chat:"):
             if data == "chat:all":
                 session["data"]["target_chats"] = await get_user_chats(uid, state, context.bot)
+            elif data == "chat:main":
+                available = await get_user_chats(uid, state, context.bot)
+                main, hint = get_main_chats_for(uid, state, available)
+                if not main:
+                    await q.answer(hint or "«Основные» недоступны", show_alert=True)
+                    # Перерисовываем выбор без мёртвой кнопки; «Назад» — только если она была
+                    markup = q.message.reply_markup
+                    has_back = bool(markup) and any(
+                        b.callback_data == "back" for row in markup.inline_keyboard for b in row
+                    )
+                    keyboard = build_chat_keyboard(available, state, include_back=has_back)
+                    try:
+                        await q.edit_message_text(chat_selection_text(hint), reply_markup=keyboard)
+                    except Exception as e:
+                        if "not modified" not in str(e).lower():
+                            logger.warning(f"chat:main redraw failed: {e}")
+                    return
+                session["data"]["target_chats"] = main
             else:
                 chat_id = int(data.replace("chat:", ""))
                 session["data"]["target_chats"] = [chat_id]
@@ -2927,9 +3066,12 @@ async def show_ttl_selection(q):
         reply_markup=keyboard
     )
 
-def build_chat_keyboard(available_chats, state, include_back=True):
-    """Клавиатура выбора целевых чатов: 'Все чаты' + по чату + опц. 'Назад'."""
-    buttons = [[InlineKeyboardButton("Все чаты", callback_data="chat:all")]]
+def build_chat_keyboard(available_chats, state, include_back=True, main_chats=None):
+    """Клавиатура выбора целевых чатов: опц. 'Основные N' + 'Все чаты' + по чату + опц. 'Назад'."""
+    buttons = []
+    if main_chats:
+        buttons.append([InlineKeyboardButton(f"⚡ Основные {len(main_chats)}", callback_data="chat:main")])
+    buttons.append([InlineKeyboardButton("Все чаты", callback_data="chat:all")])
     for chat_id in available_chats[:30]:
         chat_name = state["chats"].get(str(chat_id), {}).get("name", f"Чат {chat_id}")
         buttons.append([InlineKeyboardButton(f"📍 {chat_name}", callback_data=f"chat:{chat_id}")])
@@ -2962,9 +3104,10 @@ async def show_chat_selection(q, context, uid: int, state: Dict[str, Any]):
         await finalize_order_creation(q, context, uid, state)
         return
     
-    keyboard = build_chat_keyboard(available_chats, state, include_back=True)
+    main, hint = get_main_chats_for(uid, state, available_chats)
+    keyboard = build_chat_keyboard(available_chats, state, include_back=True, main_chats=main)
     await q.edit_message_text(
-        "🎯 Выберите целевые чаты:",
+        chat_selection_text(hint),
         reply_markup=keyboard
     )
 
@@ -3294,8 +3437,9 @@ async def handle_message(update: Update, context):
             del user_sessions[uid]
             return
         session["step"] = "chats"
-        keyboard = build_chat_keyboard(available_chats, state, include_back=False)
-        await update.message.reply_text("🎯 Выберите целевые чаты:", reply_markup=keyboard)
+        main, hint = get_main_chats_for(uid, state, available_chats)
+        keyboard = build_chat_keyboard(available_chats, state, include_back=False, main_chats=main)
+        await update.message.reply_text(chat_selection_text(hint), reply_markup=keyboard)
         return
 
     elif session["step"] == "template_name":
@@ -4131,6 +4275,7 @@ async def set_user_commands(bot, user_id: int, role: str):
         BotCommand("register", "Зарегистрировать чат"),
         BotCommand("unregister", "Убрать чат"),
         BotCommand("list", "Список чатов"),
+        BotCommand("mainchats", "Настроить «Основные» чаты"),
         BotCommand("ban", "Заблокировать пользователя"),
         BotCommand("unban", "Разблокировать пользователя"),
         BotCommand("spamstats", "Статистика нарушений"),
@@ -4252,6 +4397,7 @@ async def main():
         _app.add_handler(CommandHandler("removemerchant", cmd_removemerchant))
         _app.add_handler(CommandHandler("merchants", cmd_listmerchants))
         _app.add_handler(CommandHandler("templates", templates_cmd))
+        _app.add_handler(CommandHandler("mainchats", main_chats_cmd))
         _app.add_handler(CallbackQueryHandler(on_callback))
         _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         _app.add_handler(MessageHandler(filters.COMMAND, unknown))
