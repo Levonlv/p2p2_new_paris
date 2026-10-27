@@ -9,6 +9,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger(__name__)
+# httpx на INFO пишет полный URL запроса, а в нём BOT_TOKEN — не светим токен в journald
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Try to import telegram - if it fails, work in demo mode
 try:
